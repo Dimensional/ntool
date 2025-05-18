@@ -61,7 +61,7 @@ elif sys.argv[1] == 'cia2cdn':
             cia_dev = 1
     cia2cdn(path, out, titlekey, cia_dev)
 
-elif sys.argv[1] == 'help' or sys.argv <= 2:
+elif sys.argv[1] == 'help' or sys.argv < 2:
     print("To run this script, you need to provide arguments.")
     print("Here is a list of arguments and examples for each one.")
     print("")
