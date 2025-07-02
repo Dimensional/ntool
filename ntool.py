@@ -2,7 +2,7 @@
 import sys
 from utils import *
 
-if len(sys.argv) <= 1 or sys.argv[1] == 'help':
+if len(sys.argv) <= 1 or sys.argv[1] == 'help' or sys.argv[1] == '--help':
     print("To run this script, you need to provide arguments.")
     print("Here is a list of arguments and examples for each one.")
     print("")
