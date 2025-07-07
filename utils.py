@@ -1,5 +1,5 @@
 from lib.common import *
-from lib.keys import NTR, TWL
+from lib.keys import NTR, TWL, CTR
 from lib.ctr_cia import CIAReader, CIABuilder
 from lib.ctr_cci import CCIReader, CCIBuilder
 from lib.ctr_ncch import NCCHReader, NCCHBuilder
@@ -11,6 +11,10 @@ from lib.ctr_tik import tikReader, tikBuilder
 from lib.ctr_cdn import CDNReader, CDNBuilder
 from lib.ctr_cnt import cntReader
 from lib.ntr_twl_srl import SRLReader, get_rsa_key_idx
+import hashlib
+import logging
+
+logger = logging.getLogger(__name__)
 
 def srl_retail2dev(path, out=''):
     name = os.path.splitext(os.path.basename(path))[0]
@@ -578,7 +582,9 @@ def cci2cia(path, out='', cci_dev=0, cia_dev=0):
         if os.path.exists(i):
             os.remove(i)
 
-def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0):
+
+
+def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
     os.chdir(path)
     name = os.path.basename(os.getcwd())
 
@@ -610,11 +616,98 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0):
 
     t = TMDReader(tmd)
     if out == '':
-        out = f'{name}.{t.hdr.title_ver}.cia'
+        if decrypt:
+            out = f'{name}.{t.hdr.title_ver}.decrypted.cia'
+        else:
+            out = f'{name}.{t.hdr.title_ver}.cia'
     
     cdn = CDNReader(content_files=content_files, tmd=tmd, tik=tik, dev=cdn_dev)
     cdn.extract()
     cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
+    logger.debug(f'Extracted content files: {cf}')
+    
+    if decrypt:
+        # Check for seed crypto and decrypt using Python-native implementation
+        for ncch_file in cf:
+            if ncch_file.endswith('.ncch'):
+                logger.debug(f'Processing {ncch_file}, size: {os.path.getsize(ncch_file)} bytes')
+                
+                # First, verify the file is a valid NCCH
+                with open(ncch_file, 'rb') as f:
+                    f.seek(0x100)  # Magic should be at 0x100
+                    magic = f.read(4)
+                    logger.debug(f'NCCH magic for {ncch_file}: {magic}')
+                    if magic != b'NCCH':
+                        logger.warning(f'{ncch_file} does not appear to be a valid NCCH file (magic: {magic})')
+                        continue
+                    
+                    # Get Title ID and Program ID for debugging
+                    f.seek(0x108)  # Title ID at 0x108
+                    title_id = f.read(8)
+                    f.seek(0x118)  # Program ID at 0x118 
+                    program_id = f.read(8)
+                    logger.debug(f'{ncch_file} Title ID: {title_id.hex()}, Program ID: {program_id.hex()}')
+                    
+                    # Check if it uses seed crypto
+                    f.seek(0x18F)  # flags[7]
+                    flags = f.read(1)
+                    uses_seed = flags[0] & 0x20 if len(flags) > 0 else False
+                    is_decrypted = flags[0] & 0x4 if len(flags) > 0 else False
+                    fixed_key = flags[0] & 0x1 if len(flags) > 0 else False
+                    
+                    logger.debug(f'{ncch_file} - flags[7]: 0x{flags[0]:02x}')
+                    logger.debug(f'{ncch_file} - uses_seed: {uses_seed}, is_decrypted: {is_decrypted}, fixed_key: {fixed_key}')
+                    
+                    if uses_seed:
+                        # Read seed hash from header for verification
+                        f.seek(0x114)  # seed_hash at 0x114
+                        seed_hash = f.read(4)
+                        logger.debug(f'{ncch_file} - seed_hash: {seed_hash.hex()}')
+                        logger.info(f'*** {ncch_file} USES SEED CRYPTO ***')
+                
+                # Decrypt NCCH (both regular and seed crypto are handled by NCCHReader)
+                if not is_decrypted:
+                    if uses_seed:
+                        logger.info(f'*** {ncch_file} USES SEED CRYPTO - decrypting ***')
+                    else:
+                        logger.info(f'Decrypting regular NCCH: {ncch_file}')
+                    
+                    # Use NCCHReader to extract and decrypt the content
+                    ncch = NCCHReader(ncch_file, dev=0)
+                    ncch.extract()
+                    
+                    # Now rebuild the NCCH with decryption flag set
+                    ncch_header = 'ncch_header.bin'
+                    exheader = 'exheader.bin' if os.path.isfile('exheader.bin') else ''
+                    logo = 'logo.bin' if os.path.isfile('logo.bin') else ''
+                    plain = 'plain.bin' if os.path.isfile('plain.bin') else ''
+                    exefs = 'exefs.bin' if os.path.isfile('exefs.bin') else ''
+                    romfs = 'romfs.bin' if os.path.isfile('romfs.bin') else ''
+                    
+                    # Remove the original encrypted file
+                    os.remove(ncch_file)
+                    
+                    # Rebuild with decryption flag set (crypto='none' means decrypted)
+                    logger.info(f'Rebuilding NCCH as decrypted: {ncch_file}')
+                    NCCHBuilder(
+                        ncch_header=ncch_header, 
+                        exheader=exheader, 
+                        logo=logo, 
+                        plain=plain, 
+                        exefs=exefs, 
+                        romfs=romfs, 
+                        crypto='none',  # This creates decrypted content
+                        dev=0, 
+                        out=ncch_file
+                    )
+                    
+                    # Clean up temporary files
+                    for temp_file in [ncch_header, exheader, logo, plain, exefs, romfs]:
+                        if temp_file and os.path.isfile(temp_file):
+                            os.remove(temp_file)
+                    
+                    logger.info(f'Successfully decrypted NCCH: {ncch_file}')
+    
     tmd += '.extracted'
 
     if tik == '':
@@ -623,16 +716,196 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0):
     else:
         tik += '.extracted'
 
+    # Rebuild TMD with proper encryption flags using TMDBuilder
+    if decrypt:
+        print(f'Rebuilding TMD with decryption flags for content files: {cf}')
+        
+        # Read the original TMD to get metadata
+        t_orig = TMDReader(tmd)
+        print(f'Original TMD has {len(t_orig.files)} content entries')
+        
+        # We need to preserve the original content file naming structure
+        # The original TMD expects specific content IDs and indices
+        original_files = list(t_orig.files.keys())
+        print(f'Original TMD expects files: {original_files}')
+        print(f'We currently have files: {cf}')
+        
+        # Ensure content files match TMD expectations by renaming if necessary
+        cf_corrected = []
+        for i, original_filename in enumerate(original_files):
+            if i < len(cf):
+                current_filename = cf[i]
+                if current_filename != original_filename:
+                    print(f'Renaming {current_filename} to {original_filename}')
+                    shutil.move(current_filename, original_filename)
+                cf_corrected.append(original_filename)
+            else:
+                print(f'WARNING: Missing content file for {original_filename}')
+        
+        cf = cf_corrected
+        
+        # Create a modified TMD that preserves structure but updates for decrypted content
+        tmd_modified_path = 'tmd_decrypted'
+        with open(tmd, 'rb') as f_in, open(tmd_modified_path, 'wb') as f_out:
+            # Copy signature type
+            sig_type = readbe(f_in.read(4))
+            f_out.write(sig_type.to_bytes(4, 'big'))
+            
+            # Get signature and padding sizes from the signature_types mapping
+            from lib.ctr_tik import signature_types
+            sig_size, sig_padding = signature_types[sig_type]
+            
+            original_sig = f_in.read(sig_size)
+            original_padding = f_in.read(sig_padding)
+            f_out.write(original_sig)  # We'll replace this later
+            f_out.write(original_padding)
+            
+            # Copy TMD header unchanged (this preserves title ID, version, etc.)
+            tmd_hdr_data = f_in.read(0xC4)
+            f_out.write(tmd_hdr_data)
+            
+            # Copy content info records unchanged (64 * 36 = 0x900 bytes)
+            content_info_data = f_in.read(0x900)
+            f_out.write(content_info_data)
+            
+            # Now modify content chunk records
+            content_count = t_orig.hdr.content_count
+            print(f'Processing {content_count} content chunk records...')
+            
+            content_chunks_data = bytearray()
+            for i in range(content_count):
+                chunk_data = bytearray(f_in.read(0x30))  # 48 bytes per chunk
+                
+                if i < len(cf):
+                    # Recalculate hash and size for this content file
+                    content_file = cf[i]
+                    print(f'Updating content chunk {i}: {content_file}')
+                    
+                    # Calculate new hash and size
+                    with open(content_file, 'rb') as cf_file:
+                        content_size = os.path.getsize(content_file)
+                        new_hash = Crypto.sha256(cf_file, content_size)
+                        
+                        # Update hash in chunk (bytes 16-47 are the SHA256 hash)
+                        chunk_data[16:48] = new_hash
+                        
+                        # Update size (bytes 8-15 are the content size)
+                        chunk_data[8:16] = content_size.to_bytes(8, 'big')
+                        
+                        # Update encryption flag (byte 6-7 are content type flags)
+                        content_type = int.from_bytes(chunk_data[6:8], 'big')
+                        # Clear encryption flag (bit 0) since we're creating decrypted content
+                        content_type &= ~1
+                        chunk_data[6:8] = content_type.to_bytes(2, 'big')
+                        
+                        print(f'  Content {i}: size={content_size}, hash={new_hash.hex()[:16]}..., type=0x{content_type:04x}')
+                else:
+                    print(f'WARNING: No content file for chunk {i}, leaving unchanged')
+                
+                content_chunks_data.extend(chunk_data)
+            
+            # Regenerate content info records with new content chunk hashes
+            content_info_new = bytearray(0x900)  # 64 * 36 bytes
+            # Fill first content info record
+            content_info_new[0:2] = (0).to_bytes(2, 'big')  # content_index_offset
+            content_info_new[2:4] = content_count.to_bytes(2, 'big')  # content_command_count
+            # Calculate hash of all content chunks
+            h = hashlib.sha256()
+            h.update(content_chunks_data)
+            content_chunks_hash = h.digest()
+            content_info_new[4:36] = content_chunks_hash  # content_chunk_record_hash
+            
+            # Calculate new content info records hash for TMD header
+            h = hashlib.sha256()
+            h.update(content_info_new)
+            content_info_hash = h.digest()
+            
+            # Update the TMD header with new content info records hash
+            tmd_hdr_data = bytearray(tmd_hdr_data)
+            tmd_hdr_data[0xA4:0xC4] = content_info_hash  # content_info_records_hash at offset 0xA4
+            
+            # Write the corrected TMD header
+            f_out.seek(4 + sig_size + sig_padding)
+            f_out.write(tmd_hdr_data)
+            
+            # Write updated content info records
+            f_out.write(content_info_new)
+            
+            # Write updated content chunks
+            f_out.write(content_chunks_data)
+        
+        # Regenerate signature for the modified TMD
+        if regen_sig:
+            print(f'Regenerating TMD signature...')
+            # Read the TMD data that needs to be signed (everything after sig + padding)
+            with open(tmd_modified_path, 'rb') as f:
+                f.seek(4 + sig_size + sig_padding)  # Skip to TMD data
+                tmd_data_to_sign = f.read()
+            
+            # Generate new signature using the same approach as TMDBuilder
+            if regen_sig == 'retail':
+                # Use test keys for retail (same as TMDBuilder does)
+                new_sig = Crypto.sign_rsa_sha256(CTR.test_mod, CTR.test_priv, tmd_data_to_sign)
+            else:  # dev
+                new_sig = Crypto.sign_rsa_sha256(CTR.tmd_mod[1], CTR.tmd_priv[1], tmd_data_to_sign)
+            
+            # Write the new signature
+            with open(tmd_modified_path, 'r+b') as f:
+                f.seek(4)  # Skip sig_type
+                f.write(new_sig)
+        
+        tmd_to_use = tmd_modified_path
+        tmd_to_cleanup = [tmd, tmd_modified_path]
+        print(f'Using modified TMD: {tmd_to_use}')
+    else:
+        tmd_to_use = tmd
+        tmd_to_cleanup = [tmd]
+
     meta = 1
     if t.titleID[3:5] == '48':
         meta = 0
-    CIABuilder(content_files=cf, tik=tik, tmd=tmd, meta=meta, dev=cia_dev, out='tmp.cia')
-    for i in cf + [tmd, tik]:
-        os.remove(i)
+    
+    # Debug: Check TMD content before building CIA
+    if decrypt:
+        debug_tmd = TMDReader(tmd_to_use)
+        print('DEBUG: TMD files info:')
+        for fname, finfo in debug_tmd.files.items():
+            hash_hex = finfo['hash'].hex() if 'hash' in finfo else None
+            print(f'  {fname}: size={finfo.get("size")}, crypt={finfo.get("crypt")}, hash={hash_hex}, has_key={"key" in finfo}')
+    
+    CIABuilder(content_files=cf, tik=tik, tmd=tmd_to_use, meta=meta, dev=cia_dev, out='tmp.cia')
+    
+    # Clean up files - be more comprehensive to avoid leftover files
+    cleanup_files = cf + [tik]
+    if decrypt:
+        cleanup_files += tmd_to_cleanup  # tmd_to_cleanup is already a list
+    else:
+        cleanup_files += tmd_to_cleanup  # tmd_to_cleanup is a list with one item
+    
+    # Also clean up any pattern-based files that might be left over
+    for pattern_file in os.listdir('.'):
+        # Clean up extracted TMD files (tmd.*.extracted)
+        if pattern_file.startswith('tmd.') and pattern_file.endswith('.extracted'):
+            cleanup_files.append(pattern_file)
+        # Clean up any remaining NCCH files that weren't in cf
+        elif pattern_file.endswith('.ncch'):
+            if pattern_file not in cleanup_files:
+                cleanup_files.append(pattern_file)
+        # Clean up any remaining ticket files
+        elif pattern_file.startswith('tik') or pattern_file == 'cetk.extracted':
+            if pattern_file not in cleanup_files:
+                cleanup_files.append(pattern_file)
+        # Don't clean up tmp.cia yet - we need it for the move operation
+    
+    for i in cleanup_files:
+        if os.path.isfile(i):
+            os.remove(i)
 
     shutil.move('tmp.cia', '../tmp.cia')
     os.chdir('..')
     shutil.move('tmp.cia', out)
+    print(f"Renamed tmp.cia to {out} and moved it to the current directory")
+    print(f'Converted CDN to CIA: {out}')
 
 def cia2cdn(path, out='', titlekey='', cia_dev=0):
     name = os.path.splitext(os.path.basename(path))[0]

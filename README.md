@@ -55,14 +55,16 @@ cdn_folder/
 - If `--title-ver` is not provided and there are multiple TMD versions in the CDN folder, the latest TMD will be used
 - If a `cetk` exists in the CDN folder, it will be used as the ticket; if not, a ticket with a fake signature will be generated and used
 - Pass `--cdn-dev` if the CDN contents are dev-crypted/signed, pass `--cia-dev` if you want to build a dev-signed CIA
+- Pass `--decrypt` if the CDN contents are to be decrypted before packaging. Requires `seeddb.bin` placed in the directory for 9.6.0-26+ encrypted files.
 ```py
-python3 ntool.py cdn2cia <path_to_cdn_folder> (--out <path_to_output_file>) (--title-ver <ver>) (--cdn-dev) (--cia-dev)
+python3 ntool.py cdn2cia <path_to_cdn_folder> (--out <path_to_output_file>) (--title-ver <ver>) (--cdn-dev) (--cia-dev) (--decrypt)
 ```
 
 ### Convert CIA to CDN contents
 - Pass `--titlekey` to use a custom titlekey to encrypt the content files (this field will be ignored if the ticket in the CIA is signed)
 - Pass `--cia-dev` if the CIA is dev-signed
 - Note that clean CDN contents are not guaranteed as the CIA may have improper contents (e.g. due to being decrypted)
+- Will not work with decrypted CIA files.
 ```py
 python3 ntool.py cia2cdn <path_to_cia> (--out <path_to_output_folder>) (--titlekey <titlekey>) (--cia-dev)
 ```

@@ -2,6 +2,9 @@ from .common import *
 from .keys import *
 from .ctr_exefs import ExeFSFileHdr
 from .ctr_romfs import RomFSReader
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NCCHHdr(Structure):
     _fields_ = [
@@ -66,16 +69,59 @@ def get_ncch_counter(hdr, component):
     return bytes(counter)
 
 def get_seed(titleID: bytes):
-    with open(os.path.join(resources_dir, 'seeddb.bin'), 'rb') as f:
+    """
+    Get seed from seeddb.bin for the given Title ID.
+    
+    Args:
+        titleID: 8-byte Title ID (Program ID) to look up
+        
+    Returns:
+        16-byte seed for the Title ID
+        
+    Raises:
+        Exception: If seeddb.bin is not found or Title ID is not in database
+    """
+    # Try multiple locations for seeddb.bin
+    possible_paths = [
+        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'seeddb.bin'),
+        os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'resources', 'seeddb.bin'),
+    ]
+    
+    seeddb_path = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            seeddb_path = path
+            break
+    
+    if seeddb_path is None:
+        raise Exception(f'seeddb.bin not found. Searched locations: {possible_paths}')
+    
+    logger.debug(f'Using seeddb.bin from: {seeddb_path}')
+    
+    with open(seeddb_path, 'rb') as f:
         seed_count = readle(f.read(4))
-        f.seek(0x10)
-        seed = -1
+        
+        # Verify header padding (should be zero)
+        padding = f.read(0x0C)
+        if padding != b'\x00' * 0x0C:
+            raise Exception('Invalid seeddb.bin header padding')
+        
+        # Search for Title ID
         for _ in range(seed_count):
             entry = f.read(0x20)
+            if len(entry) < 0x20:
+                raise Exception('Truncated seeddb.bin file')
+                
             if entry[:8] == titleID:
                 seed = entry[8:24]
-        if seed == -1:
-            raise Exception('Could not find TitleID in SEEDDB')
+                # Verify entry padding (last 8 bytes should be zero)
+                entry_padding = entry[24:32]
+                if entry_padding != b'\x00' * 8:
+                    logger.warning(f'Non-zero padding in seeddb entry for Title ID {titleID.hex()}')
+                return seed
+        
+        # Title ID not found
+        raise Exception(f'Title ID {titleID.hex()} not found in seeddb.bin')
     
     return seed
 
@@ -102,6 +148,18 @@ class NCCHReader:
         self.is_decrypted = self.hdr.flags[7] & 0x4
         self.uses_seed = self.hdr.flags[7] & 0x20
 
+        # Debug output for encryption status
+        logger.debug(f'NCCH File: {file}')
+        logger.debug(f'Title ID: {bytes(self.hdr.titleID).hex()}')
+        logger.debug(f'Program ID: {bytes(self.hdr.programID).hex()}')
+        logger.debug(f'Flags[7]: 0x{self.hdr.flags[7]:02x}')
+        logger.debug(f'Uses seed crypto: {self.uses_seed}')
+        logger.debug(f'Is decrypted: {self.is_decrypted}')
+        logger.debug(f'Fixed key: {self.fixed_key}')
+        if self.uses_seed:
+            logger.debug(f'Seed hash in header: {bytes(self.hdr.seed_hash).hex()}')
+        logger.debug('---')
+
         # Generate keys
         if self.fixed_key:
             if readle(bytes(self.hdr.titleID)) & (0x10 << 32): # System category bit set in TitleID
@@ -113,15 +171,30 @@ class NCCHReader:
             self.keyX = [CTR.KeyX0x2C[dev], self.keyX_2[dev]]
             
             if self.uses_seed: # This will result in keyY_2 being different
-                seed = get_seed(bytes(self.hdr.programID))
-                
-                # Verify seed in SEEDDB
-                if hashlib.sha256(seed + self.hdr.programID).digest()[:4] != bytes(self.hdr.seed_hash):
-                    raise Exception('Seed in SEEDDB failed verification')
-                
-                self.keyY[1] = hashlib.sha256(self.keyY[0] + seed).digest()[:16]
+                try:
+                    seed = get_seed(bytes(self.hdr.programID))
+                    
+                    # Verify seed in SEEDDB (matches ctrtool validation)
+                    expected_hash = hashlib.sha256(seed + self.hdr.programID).digest()[:4]
+                    actual_hash = bytes(self.hdr.seed_hash)
+                    
+                    if expected_hash != actual_hash:
+                        raise Exception(f'Seed validation failed. Expected: {expected_hash.hex()}, Got: {actual_hash.hex()}')
+                    
+                    # Generate seeded keyY (matches ctrtool key generation)
+                    self.keyY[1] = hashlib.sha256(self.keyY[0] + seed).digest()[:16]
+                    
+                except Exception as e:
+                    logger.warning(f'Seed crypto error for Program ID {bytes(self.hdr.programID).hex()}: {e}')
+                    raise
 
             self.normal_key = [CTR.key_scrambler(self.keyX[i], readbe(self.keyY[i])) for i in range(2)]
+            
+            # Debug output for generated keys
+            logger.debug(f'Generated normal_key[0]: {self.normal_key[0].hex()}')
+            logger.debug(f'Generated normal_key[1]: {self.normal_key[1].hex()}')
+            if self.uses_seed:
+                logger.debug(f'Used seeded keyY[1]: {self.keyY[1].hex()}')
     
         # Get component offset, size, AES-CTR key and initial value for counter, hash and size of component to calculate hash over
         # Exheader, ExeFS and RomFS are encrypted
@@ -177,16 +250,45 @@ class NCCHReader:
             cipher = AES.new(self.normal_key[0], AES.MODE_CTR, counter=counter)
             with open(file, 'rb') as f:
                 f.seek(self.hdr.exefs_offset * media_unit)
+                exefs_raw_data = f.read(0xA0)
+                
                 if self.is_decrypted or build:
-                    exefs_file_hdr = f.read(0xA0)
+                    exefs_file_hdr = exefs_raw_data
+                    logger.debug(f'Reading ExeFS header (decrypted)')
                 else:
-                    exefs_file_hdr = cipher.decrypt(f.read(0xA0))
+                    exefs_file_hdr = cipher.decrypt(exefs_raw_data)
+                    logger.debug(f'Reading ExeFS header (encrypted, decrypting with normal_key[0])')
+                
+                logger.debug(f'ExeFS header first 32 bytes: {exefs_file_hdr[:32].hex()}')
             
             exefs_files = [(0, 0x200, 0, 'header')] # Each tuple is (offset in ExeFS, size, normal_key index, name)
+            
+            # Check if ExeFS header looks valid (first entry should have reasonable values)
+            first_entry = ExeFSFileHdr(exefs_file_hdr[0:16])
+            if first_entry.size == 0 or first_entry.size > 0x1000000:  # Sanity check: size should be reasonable
+                logger.warning(f'ExeFS header may be corrupted or incorrectly decrypted (first entry size: {first_entry.size})')
+            
             for i in range(10):
                 file_hdr = ExeFSFileHdr(exefs_file_hdr[i * 16:(i + 1) * 16])
                 if file_hdr.size:
-                    name = file_hdr.name.decode('utf-8').strip('\0')
+                    try:
+                        # Try to decode the name, with additional validation
+                        raw_name = bytes(file_hdr.name)
+                        # Check if this looks like encrypted data (high entropy, non-printable chars)
+                        if any(b < 0x20 or b > 0x7E for b in raw_name[:8] if b != 0):
+                            raise UnicodeDecodeError('utf-8', raw_name, 0, 1, 'Contains non-printable characters')
+                        
+                        name = file_hdr.name.decode('utf-8').strip('\0')
+                        if not name or len(name) > 8:  # ExeFS names should be reasonable
+                            raise UnicodeDecodeError('utf-8', raw_name, 0, 1, 'Invalid name length')
+                            
+                    except UnicodeDecodeError:
+                        # ExeFS header might still be encrypted, use a placeholder name
+                        name = f'file_{i}'
+                        logger.warning(f'Could not decode ExeFS file name at index {i} (raw: {bytes(file_hdr.name).hex()}), using placeholder "{name}"')
+                    
+                    logger.debug(f'ExeFS file {i}: name="{name}", offset=0x{file_hdr.offset:x}, size=0x{file_hdr.size:x}')
+                    
                     if name in ('icon', 'banner'):
                         exefs_files.append((0x200 + file_hdr.offset, file_hdr.size, 0, name))
                     else:
