@@ -85,7 +85,7 @@ def get_seed(titleID: bytes):
     possible_paths = [
         os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'seeddb.bin'),
         os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'resources', 'seeddb.bin'),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'resources', 'seeddb.bin'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'seeddb.bin'),
     ]
     
     seeddb_path = None
