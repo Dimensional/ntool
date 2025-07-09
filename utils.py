@@ -894,7 +894,7 @@ def cdn2cia_reversible_decrypt(path, out='', title_ver='', cdn_dev=0, cia_dev=0)
         content_info.append({
             'id': original_chunk.contentID,
             'index': original_chunk.content_index, 
-            'type': 0x0000,  # Set to 0x0000 for decrypted content (no encryption flag)
+            'type': original_chunk.content_type & ~0x0001,  # Preserve all flags except encryption flag
             'size': content_size,
             'hash': content_hash
         })
@@ -1165,21 +1165,26 @@ def cia2cdn_encrypted(reversible_cia_path, out='', cia_dev=0, titlekey=''):
             content_size = len(content_data)
         
         # Get original content info from decrypted TMD
-        original_content_list = list(tmd_reader.files.values())
-        if i < len(original_content_list):
-            original_content = original_content_list[i]
-            # Get the content index and ID from the filename
-            name_parts = ncch_file.split('.')
-            content_index = int(name_parts[0], 16) if len(name_parts) > 0 else i
-            content_id = int(name_parts[1], 16) if len(name_parts) > 1 else i
-            
-            content_info.append({
-                'id': content_id,
-                'index': content_index,
-                'type': 0x1,  # Set to encrypted (standard)
-                'size': content_size,
-                'hash': content_hash
-            })
+        # Find the matching content chunk by filename pattern
+        original_chunk = None
+        for chunk in tmd_reader.content_chunks:
+            expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
+            if ncch_file == expected_name:
+                original_chunk = chunk
+                break
+        
+        if original_chunk is None:
+            # Fallback: use index-based matching
+            original_chunk = tmd_reader.content_chunks[i]
+            logger.warning(f'No filename match for {ncch_file}, using index-based matching')
+        
+        content_info.append({
+            'id': original_chunk.contentID,
+            'index': original_chunk.content_index,
+            'type': original_chunk.content_type | 0x0001,  # Preserve all flags and add encryption flag
+            'size': content_size,
+            'hash': content_hash
+        })
     
     # Build new TMD with encrypted content flags (for CDN) and preserved signature
     logger.info('Building encrypted TMD for CDN with preserved signature...')

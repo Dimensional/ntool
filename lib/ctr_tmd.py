@@ -224,17 +224,20 @@ class TMDBuilder:
                 if save_data_size == '':
                     if content_files:
                         ncch = NCCHReader(content_files[0], dev=content_files_dev)
-                    if 'exheader.bin' in ncch.files.keys(): # If exheader exists, read savedata size from it. Otherwise, savedata size is set to 0
-                        info = ncch.files['exheader.bin']
-                        with open(content_files[0], 'rb') as f:
-                            f.seek(info['offset'])
-                            if ncch.is_decrypted:
-                                exheader = f.read(info['size'])
-                            else:
-                                counter = Counter.new(128, initial_value=readbe(info['counter']))
-                                cipher = AES.new(info['key'], AES.MODE_CTR, counter=counter)
-                                exheader = cipher.decrypt(f.read(info['size']))
-                        save_data_size = readbe(exheader[0x1C0:0x1C4])
+                        if 'exheader.bin' in ncch.files.keys(): # If exheader exists, read savedata size from it
+                            info = ncch.files['exheader.bin']
+                            with open(content_files[0], 'rb') as f:
+                                f.seek(info['offset'])
+                                if ncch.is_decrypted:
+                                    exheader = f.read(info['size'])
+                                else:
+                                    counter = Counter.new(128, initial_value=readbe(info['counter']))
+                                    cipher = AES.new(info['key'], AES.MODE_CTR, counter=counter)
+                                    exheader = cipher.decrypt(f.read(info['size']))
+                            save_data_size = readbe(exheader[0x1C0:0x1C4])
+                        else:
+                            # No exheader found - set savedata size to 0 (common for DLC and manual content)
+                            save_data_size = 0
         
         # Create (or modify) TMD header
         if tmd == '':

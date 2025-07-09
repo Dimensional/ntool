@@ -367,6 +367,10 @@ class CIABuilder:
 
         if meta:
             ncch = NCCHReader(content_files[0], dev=dev)
+            exheader = None
+            icon = b''
+            
+            # Check for exheader first
             if 'exheader.bin' in ncch.files.keys():
                 info = ncch.files['exheader.bin']
                 g = open(content_files[0], 'rb')
@@ -377,9 +381,12 @@ class CIABuilder:
                     counter = Counter.new(128, initial_value=readbe(info['counter']))
                     cipher = AES.new(info['key'], AES.MODE_CTR, counter=counter)
                     exheader = cipher.decrypt(g.read(info['size']))
-
+                g.close()
+            
+            # Check for icon in ExeFS (works with or without exheader)
+            if 'exefs.bin' in ncch.files.keys():
                 info = ncch.files['exefs.bin']
-                icon = b''
+                g = open(content_files[0], 'rb')
                 for off, size, key, name in info['files']:
                     if name == 'icon':
                         g.seek(info['offset'] + off)
@@ -391,28 +398,33 @@ class CIABuilder:
                             cipher.decrypt(b'\0' * (off % 16))
                             icon = cipher.decrypt(g.read(size))
                         break
+                g.close()
+            
+            if icon == b'':
+                warnings.warn('Not generating meta section as could not find icon in ExeFS')
+                f.seek(0x14)
+                f.write(b'\x00' * 4) # Set meta size in header back to 0
+            else:
+                alignment = align(curr, 64)
+                if alignment:
+                    f.write(b'\x00' * alignment)
+                curr += alignment
 
-                if icon == b'':
-                    warnings.warn('Not generating meta section as could not find icon in ExeFS')
-                    f.seek(0x14)
-                    f.write(b'\x00' * 4) # Set meta size in header back to 0
-                else:
-                    alignment = align(curr, 64)
-                    if alignment:
-                        f.write(b'\x00' * alignment)
-                    curr += alignment
-
+                if exheader:
+                    # Full meta section with exheader data
                     f.write(exheader[0x40:0x40 + 0x180]) # TitleID dependency list
                     f.write(b'\x00' * 0x180)
                     f.write(exheader[0x208:0x208 + 0x4]) # Core version
                     f.write(b'\x00' * 0xFC)
-                    f.write(icon)
-                    curr += hdr.meta_size
-                g.close()
-            else:
-                warnings.warn('Not generating meta section as NCCH does not have exheader')
-                f.seek(0x14)
-                f.write(b'\x00' * 4) # Set meta size in header back to 0
+                else:
+                    # Minimal meta section for DLC without exheader
+                    f.write(b'\x00' * 0x180) # Empty TitleID dependency list
+                    f.write(b'\x00' * 0x180) # Padding
+                    f.write(b'\x00' * 0x4) # Empty core version
+                    f.write(b'\x00' * 0xFC) # Padding
+                
+                f.write(icon)
+                curr += hdr.meta_size
 
         f.close()
         print(f'Wrote to {out}')

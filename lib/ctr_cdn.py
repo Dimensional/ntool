@@ -78,7 +78,7 @@ class CDNReader:
                         g.write(cipher.decrypt(data))
                     f.close()
                     g.close()
-                    print(f'Decrypted {i} to {name}')
+                    print(f'Unpackaged {i} to {name}')
                     break
     
     def verify(self):
