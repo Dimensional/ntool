@@ -331,7 +331,8 @@ def cci_retail2dev(path, out=''):
 
 def ncch_extractall(path, dev=0):
     name = os.path.splitext(os.path.basename(path))[0]
-    os.mkdir(name)
+    if not os.path.exists(name):
+        os.mkdir(name)
 
     ncch = NCCHReader(path, dev)
     ncch.extract()
@@ -352,7 +353,8 @@ def ncch_extractall(path, dev=0):
     if os.path.isfile('exefs.bin'):
         exefs = ExeFSReader('exefs.bin')
         exefs.extract(code_compressed=exefs_code_compress)
-        os.mkdir('exefs')
+        if not os.path.exists('exefs'):
+            os.mkdir('exefs')
         for i in exefs.files.keys():
             shutil.move(i, os.path.join('exefs', i))
         if exefs_code_compress:
@@ -428,7 +430,8 @@ def ncch_rebuildall(path, dev=0):
 
 def cci_extractall(path, dev=0):
     name = os.path.splitext(os.path.basename(path))[0]
-    os.mkdir(name)
+    if not os.path.exists(name):
+        os.mkdir(name)
 
     cci = CCIReader(path, dev)
     cci.extract()
@@ -467,7 +470,8 @@ def cci_rebuildall(path, dev=0):
 
 def cia_extractall(path, dev=0):
     name = os.path.splitext(os.path.basename(path))[0]
-    os.mkdir(name)
+    if not os.path.exists(name):
+        os.mkdir(name)
 
     cia = CIAReader(path, dev)
     cia.extract()
