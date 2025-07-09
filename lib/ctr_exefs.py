@@ -1,12 +1,13 @@
 from .common import *
 from .keys import *
+import shutil
 
 if platform.system() == 'Windows':
-    tool = os.path.join(resources_dir, '3dstool.exe')
+    tool = shutil.which('3dstool.exe') or os.path.join(resources_dir, '3dstool.exe')
 elif platform.system() == 'Linux':
-    tool = os.path.join(resources_dir, '3dstool_linux')
+    tool = shutil.which('3dstool_linux') or os.path.join(resources_dir, '3dstool_linux')
 elif platform.system() == 'Darwin':
-    tool = os.path.join(resources_dir, '3dstool_macos')
+    tool = shutil.which('3dstool_macos') or os.path.join(resources_dir, '3dstool_macos')
 else:
     raise Exception('Could not identify OS')
 
