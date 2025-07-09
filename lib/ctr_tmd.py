@@ -101,16 +101,29 @@ class TMDReader:
                     ext = 'ncch'
 
                 name = f'{hex(tmd_chunk.content_index)[2:].zfill(4)}.{hex(tmd_chunk.contentID)[2:].zfill(8)}.{ext}'
+                # files[name] = {
+                #     'size': tmd_chunk.content_size,
+                #     'crypt': 'none',
+                #     'hash': bytes(tmd_chunk.content_hash),
+                # }
+
+                # if tmd_chunk.content_type & 1: # Encrypted flag set in content type
+                #     files[name]['crypt'] = 'normal'
+                #     files[name]['key'] = b''
+                #     files[name]['iv'] = int.to_bytes(tmd_chunk.content_index, 2, 'big') + (b'\0' * 14)
                 files[name] = {
                     'size': tmd_chunk.content_size,
-                    'crypt': 'none',
                     'hash': bytes(tmd_chunk.content_hash),
                 }
-
-                if tmd_chunk.content_type & 1: # Encrypted flag set in content type
+                
+                if tmd_chunk.content_type & 1:  # Encrypted flag set in content type
                     files[name]['crypt'] = 'normal'
                     files[name]['key'] = b''
                     files[name]['iv'] = int.to_bytes(tmd_chunk.content_index, 2, 'big') + (b'\0' * 14)
+                else:
+                    files[name]['crypt'] = 'none'
+                    # For decrypted content, don't include 'key' and 'iv' fields
+                    # They can be reconstructed from content_index if needed
             self.content_chunks = content_chunks
             self.files = files
     
@@ -168,12 +181,14 @@ class TMDReader:
         )
 
 class TMDBuilder:
-    def __init__(self, tmd='', content_files=[], content_files_dev=0, titleID='', title_ver=-1, save_data_size='', priv_save_data_size='', twl_flag='', crypt=1, regen_sig='', out='tmd_new'):
+    def __init__(self, tmd='', content_files=[], content_files_dev=0, content_info=[], titleID='', title_ver=-1, save_data_size='', priv_save_data_size='', twl_flag='', crypt=1, regen_sig='', preserve_signature=False, out='tmd_new'):
         '''
         tmd: path to TMD (if available)
         Following parameters are required if no TMD is provided:
             - content_files: list containing filenames of content files, which must each be named '[content index in hex, 4 chars].[contentID in hex, 8 chars].[ncch/nds]'
             - content_files_dev: 0 or 1 (whether content files are dev-crypted)
+        Alternative to content_files:
+            - content_info: list of dicts with keys 'id', 'index', 'type', 'size', 'hash' for custom content info
         Following parameters are required if no TMD is provided; if both TMD and parameter is supplied, the parameter overrides the TMD
             - titleID: titleID in hex, e.g. '000400000FF3FF00'
             - title_ver: title version in decimal
@@ -182,6 +197,7 @@ class TMDBuilder:
             - twl_flag (leave blank for auto)
             - crypt: 0 or 1
         regen_sig: '' or 'retail' (test keys) or 'dev'
+        preserve_signature: if True and an existing TMD is provided, preserve the original signature
         out: path to output file
         '''
 
@@ -195,7 +211,7 @@ class TMDBuilder:
             if regen_sig == '':
                 regen_sig = 'retail'
 
-            if content_files[0].endswith('.nds'): # Get public and private savedata size from TWL header
+            if content_files and content_files[0].endswith('.nds'): # Get public and private savedata size from TWL header
                 with open(content_files[0], 'rb') as f:
                     f.seek(0x238)
                     if save_data_size == '' or priv_save_data_size == '':
@@ -206,7 +222,8 @@ class TMDBuilder:
                         twl_flag = (readbe(f.read(1)) & 6) >> 1
             else:
                 if save_data_size == '':
-                    ncch = NCCHReader(content_files[0], dev=content_files_dev)
+                    if content_files:
+                        ncch = NCCHReader(content_files[0], dev=content_files_dev)
                     if 'exheader.bin' in ncch.files.keys(): # If exheader exists, read savedata size from it. Otherwise, savedata size is set to 0
                         info = ncch.files['exheader.bin']
                         with open(content_files[0], 'rb') as f:
@@ -221,12 +238,19 @@ class TMDBuilder:
         
         # Create (or modify) TMD header
         if tmd == '':
-            content_files.sort(key=lambda h: int(h.split('.')[0], 16)) # Sort list of content files by content index (since that is how content chunk records are ordered)
+            if content_info:
+                content_count = len(content_info)
+            elif content_files:
+                content_count = len(content_files)
+            else:
+                raise Exception('Either content_files or content_info must be provided')
+                
+            content_files.sort(key=lambda h: int(h.split('.')[0], 16)) if content_files else None # Sort list of content files by content index (since that is how content chunk records are ordered)
 
             hdr = TMDHdr(b'\x00' * 0xC4)
             hdr.format_ver = 1
             hdr.title_type = 0x40
-            hdr.content_count = len(content_files)
+            hdr.content_count = content_count
         else:
             with open(tmd, 'rb') as f:
                 sig_type = readbe(f.read(4))
@@ -236,7 +260,7 @@ class TMDBuilder:
                 content_infos_all = f.read(0x900)
                 content_chunks_all = f.read(0x30 * hdr.content_count)
         
-        if tmd == '' or regen_sig != '':
+        if tmd == '' or (regen_sig != '' and not preserve_signature):
             hdr.issuer = b'Root-CA00000003-CP0000000b'
             if regen_sig == 'dev':
                 hdr.issuer = b'Root-CA00000004-CP0000000a'
@@ -260,36 +284,64 @@ class TMDBuilder:
         # Create (or modify) content chunk records
         content_chunks = b''
         if tmd == '':
-            for i in range(len(content_files)):
-                tmd_chunk = TMDContentChunkRecord(b'\x00' * 0x30)
+            if content_info:
+                # Use provided content_info list
+                for info in content_info:
+                    tmd_chunk = TMDContentChunkRecord(b'\x00' * 0x30)
+                    tmd_chunk.content_index = info['index']
+                    tmd_chunk.contentID = info['id']
+                    tmd_chunk.content_type = info['type']
+                    tmd_chunk.content_size = info['size']
+                    tmd_chunk.content_hash = (c_uint8 * sizeof(tmd_chunk.content_hash))(*info['hash'])
+                    content_chunks += bytes(tmd_chunk)
+            elif content_files:
+                # Use content_files list (original logic)
+                for i in range(len(content_files)):
+                    tmd_chunk = TMDContentChunkRecord(b'\x00' * 0x30)
 
-                # Get content index and contentID from file name
-                name = content_files[i].split('.')
-                tmd_chunk.content_index = int(name[0], 16)
-                tmd_chunk.contentID = int(name[1], 16)
+                    # Get content index and contentID from file name
+                    name = content_files[i].split('.')
+                    tmd_chunk.content_index = int(name[0], 16)
+                    tmd_chunk.contentID = int(name[1], 16)
 
-                if crypt:
-                    tmd_chunk.content_type |= 1
-                if titleID[3:8].lower() == '4008c' and i >= 1:
-                    tmd_chunk.content_type |= 0x4000 # Set Optional flag
+                    if crypt:
+                        tmd_chunk.content_type |= 1
+                    if titleID[3:8].lower() == '4008c' and i >= 1:
+                        tmd_chunk.content_type |= 0x4000 # Set Optional flag
 
-                # Calculate hashes
-                f = open(content_files[i], 'rb')
-                tmd_chunk.content_size = os.path.getsize(content_files[i])
-                hashed = Crypto.sha256(f, tmd_chunk.content_size)
-                tmd_chunk.content_hash = (c_uint8 * sizeof(tmd_chunk.content_hash))(*hashed)
-                f.close()
+                    # Calculate hashes
+                    f = open(content_files[i], 'rb')
+                    tmd_chunk.content_size = os.path.getsize(content_files[i])
+                    hashed = Crypto.sha256(f, tmd_chunk.content_size)
+                    tmd_chunk.content_hash = (c_uint8 * sizeof(tmd_chunk.content_hash))(*hashed)
+                    f.close()
 
-                content_chunks += bytes(tmd_chunk)
+                    content_chunks += bytes(tmd_chunk)
         else:
-            for i in range(hdr.content_count):
-                tmd_chunk = TMDContentChunkRecord(content_chunks_all[i * 0x30:(i + 1) * 0x30])
-
-                tmd_chunk.content_type &= ~1 # Reset flags
-                if crypt:
-                    tmd_chunk.content_type |= 1
+            # Modify existing TMD content chunks
+            if content_info:
+                # Use provided content_info to rebuild content chunks
+                for info in content_info:
+                    tmd_chunk = TMDContentChunkRecord(b'\x00' * 0x30)
+                    tmd_chunk.content_index = info['index']
+                    tmd_chunk.contentID = info['id']
+                    tmd_chunk.content_type = info['type']
+                    tmd_chunk.content_size = info['size']
+                    tmd_chunk.content_hash = (c_uint8 * sizeof(tmd_chunk.content_hash))(*info['hash'])
+                    content_chunks += bytes(tmd_chunk)
                 
-                content_chunks += bytes(tmd_chunk)
+                # Update content count in header if it changed
+                hdr.content_count = len(content_info)
+            else:
+                # Original logic for modifying existing content chunks
+                for i in range(hdr.content_count):
+                    tmd_chunk = TMDContentChunkRecord(content_chunks_all[i * 0x30:(i + 1) * 0x30])
+
+                    tmd_chunk.content_type &= ~1 # Reset flags
+                    if crypt:
+                        tmd_chunk.content_type |= 1
+                    
+                    content_chunks += bytes(tmd_chunk)
 
         # Create content info records
         content_info = TMDContentInfoRecord(b'\x00' * 0x24)
@@ -306,10 +358,20 @@ class TMDBuilder:
         hashed = h.digest()
         hdr.content_info_records_hash = (c_uint8 * sizeof(hdr.content_info_records_hash))(*hashed)
 
-        if regen_sig == 'retail':
+        # Handle signature generation or preservation
+        if preserve_signature and tmd != '' and 'sig' in locals():
+            # Preserve original signature from existing TMD
+            pass  # sig is already loaded from the original TMD file
+        elif tmd != '' and regen_sig == '' and not preserve_signature:
+            # Default behavior: preserve original signature when modifying existing TMD unless forced to regenerate
+            pass  # sig is already loaded from the original TMD file
+        elif regen_sig == 'retail':
             sig = Crypto.sign_rsa_sha256(CTR.test_mod, CTR.test_priv, bytes(hdr))
         elif regen_sig == 'dev':
             sig = Crypto.sign_rsa_sha256(CTR.tmd_mod[1], CTR.tmd_priv[1], bytes(hdr))
+        elif tmd == '':
+            # For new TMDs without specifying regen_sig, default to retail signing
+            sig = Crypto.sign_rsa_sha256(CTR.test_mod, CTR.test_priv, bytes(hdr))
         
         # Write TMD
         with open(f'{out}', 'wb') as f:

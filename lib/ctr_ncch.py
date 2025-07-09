@@ -85,6 +85,7 @@ def get_seed(titleID: bytes):
     possible_paths = [
         os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'seeddb.bin'),
         os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'resources', 'seeddb.bin'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'resources', 'seeddb.bin'),
     ]
     
     seeddb_path = None
@@ -339,9 +340,14 @@ class NCCHReader:
             g.close()
         f.close()
 
-    def decrypt(self):
+    def decrypt(self, out=''):
+        if out == '':
+            # Generate output filename based on input filename
+            base_name = os.path.splitext(os.path.basename(self.file))[0]
+            out = f'{base_name}.decrypted.ncch'
+        
         f = open(self.file, 'rb')
-        g = open('decrypted.ncch', 'wb')
+        g = open(out, 'wb')
         curr = 0
         for name, info in self.files.items():
             if curr < info['offset']: # Padding between NCCH components
@@ -352,10 +358,12 @@ class NCCHReader:
 
             if name == 'ncch_header.bin':
                 hdr_dec = self.hdr
-                hdr_dec.flags[3] = 0 # Set keyX_2 to Key 0x2C
-                hdr_dec.flags[7] |= 4 # Set NoCrypto flag
-                hdr_dec.flags[7] &= ~1 # Unset FixedCryptoKey flag
-                hdr_dec.flags[7] &= ~0x20 # Unset UseSeedCrypto flag
+                # hdr_dec.flags[3] = 0 # Set keyX_2 to Key 0x2C
+                # hdr_dec.flags[7] |= 4 # Set NoCrypto flag
+                # hdr_dec.flags[7] &= ~1 # Unset FixedCryptoKey flag
+                # hdr_dec.flags[7] &= ~0x20 # Unset UseSeedCrypto flag
+                # For reversibility, only set the NoCrypto flag and preserve all other flags
+                hdr_dec.flags[7] |= 4 # Set NoCrypto flag (bit 2)
                 g.write(bytes(hdr_dec))
             elif self.is_decrypted or info['crypt'] == 'none':
                 for data in read_chunks(f, info['size']):
@@ -377,7 +385,67 @@ class NCCHReader:
             
         f.close()
         g.close()
-        print(f'Decrypted to decrypted.ncch')
+        print(f'Decrypted to {out}')
+        return out  # Return the output filename for convenience
+
+    def encrypt(self, out=''):
+        """
+        Re-encrypt a decrypted NCCH, restoring original flags except NoCrypto.
+        This is the reverse of decrypt() - assumes the NCCH is currently decrypted
+        and restores it to an encrypted state.
+        """
+        if not self.is_decrypted:
+            raise Exception('NCCH is not decrypted - cannot encrypt')
+        
+        if out == '':
+            # Generate output filename based on input filename
+            base_name = os.path.splitext(os.path.basename(self.file))[0]
+            if base_name.endswith('.decrypted'):
+                base_name = base_name[:-10]  # Remove '.decrypted' suffix
+            out = f'{base_name}.encrypted.ncch'
+        
+        f = open(self.file, 'rb')
+        g = open(out, 'wb')
+        curr = 0
+        for name, info in self.files.items():
+            if curr < info['offset']: # Padding between NCCH components
+                pad_size = info['offset'] - curr
+                g.write(b'\x00' * pad_size)
+                curr += pad_size
+            f.seek(info['offset'])
+
+            if name == 'ncch_header.bin':
+                # Read current header and restore original flags
+                hdr_enc = self.hdr
+                # Clear NoCrypto flag (bit 2) to restore encrypted state
+                hdr_enc.flags[7] &= ~4  # Unset NoCrypto flag
+                # All other flags should already be preserved from original
+                g.write(bytes(hdr_enc))
+            elif info['crypt'] == 'none':
+                # Plain data, copy as-is
+                for data in read_chunks(f, info['size']):
+                    g.write(data)
+            elif info['crypt'] == 'normal':
+                # Re-encrypt normal content
+                counter = Counter.new(128, initial_value=readbe(info['counter']))
+                cipher = AES.new(info['key'], AES.MODE_CTR, counter=counter)
+                for data in read_chunks(f, info['size']):
+                    g.write(cipher.encrypt(data))
+            elif info['crypt'] == 'exefs':
+                # Re-encrypt ExeFS with proper key handling
+                for off, size, key, _ in info['files']:
+                    f.seek(info['offset'] + off)
+                    counter = Counter.new(128, initial_value=readbe(info['counter']) + (off // 16))
+                    cipher = AES.new(info['key'][key], AES.MODE_CTR, counter=counter)
+                    cipher.encrypt(b'\0' * (off % 16))  # Advance cipher state
+                    for data in read_chunks(f, size):
+                        g.write(cipher.encrypt(data))
+            curr += info['size']
+            
+        f.close()
+        g.close()
+        print(f'Encrypted to {out}')
+        return out  # Return the output filename for convenience
 
     def verify(self):
         f = open(self.file, 'rb')
