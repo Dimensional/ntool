@@ -602,11 +602,6 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
         cia_dev: Whether output CIA should be dev-signed (0=retail, 1=dev)
         decrypt: Whether to decrypt NCCH content (0=keep encrypted, 1=decrypt)
     """
-    # Always use reversible decryption for decrypted CIAs
-    if decrypt:
-        return cdn2cia_reversible_decrypt(path, out, title_ver, cdn_dev, cia_dev)
-    
-    # Standard encrypted CIA conversion
     os.chdir(path)
     name = os.path.basename(os.getcwd())
 
@@ -638,13 +633,72 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
 
     t = TMDReader(tmd)
     if out == '':
-        out = f'{name}.{t.hdr.title_ver}.cia'
+        if decrypt:
+            out = f'{name}.{t.hdr.title_ver}.decrypted.cia'
+        else:
+            out = f'{name}.{t.hdr.title_ver}.encrypted.cia'
     
     cdn = CDNReader(content_files=content_files, tmd=tmd, tik=tik, dev=cdn_dev)
     cdn.extract()
     cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
     
     tmd += '.extracted'
+    
+    # Branch: If decrypt requested, decrypt NCCHs and rebuild TMD
+    if decrypt:
+        logger.info('Decrypting NCCH files and building reversible TMD...')
+        
+        # Decrypt NCCH files using minimal flag changes
+        for ncch_file in cf:
+            if ncch_file.endswith('.ncch'):
+                ncch = NCCHReader(ncch_file, dev=cdn_dev)
+                if not ncch.is_decrypted:
+                    logger.info(f'Decrypting NCCH: {ncch_file}')
+                    decrypted_file = ncch.decrypt()
+                    os.remove(ncch_file)
+                    shutil.move(decrypted_file, ncch_file)
+        
+        # Read original TMD for metadata preservation
+        t_orig = TMDReader(tmd)
+        
+        # Calculate new hashes for decrypted content files and build new TMD
+        content_info = []
+        cf_sorted = sorted(cf)
+        
+        for i, ncch_file in enumerate(cf_sorted):
+            with open(ncch_file, 'rb') as f:
+                content_data = f.read()
+                content_hash = hashlib.sha256(content_data).digest()
+                content_size = len(content_data)
+            
+            # Match with original content chunk
+            original_chunk = None
+            for chunk in t_orig.content_chunks:
+                expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
+                if ncch_file == expected_name:
+                    original_chunk = chunk
+                    break
+            
+            if original_chunk is None:
+                original_chunk = t_orig.content_chunks[i]
+            
+            content_info.append({
+                'id': original_chunk.contentID,
+                'index': original_chunk.content_index,
+                'type': original_chunk.content_type & ~0x0001,  # Preserve all flags except encryption flag
+                'size': content_size,
+                'hash': content_hash
+            })
+        
+        # Build new TMD with preserved signature
+        tmd_new = 'tmd.decrypted'
+        TMDBuilder(
+            tmd=tmd,
+            content_info=content_info,
+            preserve_signature=True,
+            out=tmd_new
+        )
+        tmd = tmd_new
 
     if tik == '':
         tikBuilder(titleID=t.titleID, title_ver=t.hdr.title_ver, titlekey=hex(readbe(cdn.titlekey))[2:].zfill(32), regen_sig=regen_sig, out='tik')
@@ -667,7 +721,7 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
     shutil.move('tmp.cia', out)
     print(f'Converted CDN to CIA: {out}')
 
-def cia2cdn(path, out='', titlekey='', cia_dev=0, auto_detect=True):
+def cia2cdn(path, out='', titlekey='', cia_dev=0):
     """
     Convert CIA to CDN format with auto-detection of encryption state.
     
@@ -676,38 +730,7 @@ def cia2cdn(path, out='', titlekey='', cia_dev=0, auto_detect=True):
         out: Output directory name (auto-generated if empty)
         titlekey: Optional titlekey override (hex string)
         cia_dev: Whether CIA uses dev crypto (0=retail, 1=dev)
-        auto_detect: Whether to auto-detect if CIA needs re-encryption for CDN
     """
-    if auto_detect:
-        # Check if this is a reversible decrypted CIA that needs re-encryption
-        cia = CIAReader(path, cia_dev)
-        cia.extract()
-        
-        # Check TMD to see if content is marked as decrypted
-        tmd_reader = TMDReader('tmd', cia_dev)
-        is_decrypted_content = False
-        
-        # Check if any content chunks have decrypted flags
-        for chunk in tmd_reader.content_chunks:
-            if (chunk.content_type & 1) == 0:  # Missing encryption flag
-                is_decrypted_content = True
-                break
-        
-        # Clean up extracted files
-        for cleanup_file in ['cia_header.bin', 'cert.bin', 'tmd', 'tik', 'meta.bin']:
-            if os.path.isfile(cleanup_file):
-                os.remove(cleanup_file)
-        
-        cf_temp = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
-        for temp_file in cf_temp:
-            if os.path.isfile(temp_file):
-                os.remove(temp_file)
-        
-        if is_decrypted_content:
-            # This appears to be a reversible decrypted CIA - use the enhanced function
-            return cia2cdn_encrypted(path, out, cia_dev, titlekey)
-    
-    # Use original logic for standard encrypted CIAs
     name = os.path.splitext(os.path.basename(path))[0]
     if out == '':
         out = name
@@ -718,12 +741,85 @@ def cia2cdn(path, out='', titlekey='', cia_dev=0, auto_detect=True):
         if os.path.isfile(i):
             os.remove(i)
     
+    # Read TMD to check encryption state
+    tmd_reader = TMDReader('tmd', cia_dev)
+    cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
+    
+    # Check if content is marked as decrypted
+    is_decrypted_content = False
+    for chunk in tmd_reader.content_chunks:
+        if (chunk.content_type & 1) == 0:  # Missing encryption flag
+            is_decrypted_content = True
+            break
+    
+    # Branch: If content is decrypted, re-encrypt NCCHs and rebuild TMD
+    if is_decrypted_content:
+        logger.info('Detected decrypted content, re-encrypting for CDN...')
+        
+        # Re-encrypt NCCH files
+        for ncch_file in cf:
+            if ncch_file.endswith('.ncch'):
+                ncch = NCCHReader(ncch_file, dev=cia_dev)
+                
+                if ncch.is_decrypted:
+                    logger.info(f'Re-encrypting NCCH: {ncch_file}')
+                    encrypted_file = ncch.encrypt()
+                    
+                    os.remove(ncch_file)
+                    shutil.move(encrypted_file, ncch_file)
+        
+        # Calculate new hashes for re-encrypted content files and rebuild TMD
+        content_info = []
+        cf_sorted = sorted(cf)
+        
+        for i, ncch_file in enumerate(cf_sorted):
+            with open(ncch_file, 'rb') as f:
+                content_data = f.read()
+                content_hash = hashlib.sha256(content_data).digest()
+                content_size = len(content_data)
+            
+            # Match with original content chunk
+            original_chunk = None
+            for chunk in tmd_reader.content_chunks:
+                expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
+                if ncch_file == expected_name:
+                    original_chunk = chunk
+                    break
+            
+            if original_chunk is None:
+                original_chunk = tmd_reader.content_chunks[i]
+            
+            content_info.append({
+                'id': original_chunk.contentID,
+                'index': original_chunk.content_index,
+                'type': original_chunk.content_type | 0x0001,  # Preserve all flags and add encryption flag
+                'size': content_size,
+                'hash': content_hash
+            })
+        
+        # Build new TMD with encrypted content flags
+        tmd_encrypted = 'tmd.encrypted'
+        TMDBuilder(
+            tmd='tmd',
+            content_info=content_info,
+            crypt=1,  # Set encrypted flag for CDN format
+            out=tmd_encrypted
+        )
+        
+        # Replace TMD with encrypted version
+        os.remove('tmd')
+        shutil.move(tmd_encrypted, 'tmd')
+    
+    # Clean up CIA components we don't need
+    for i in ['cia_header.bin', 'cert.bin', 'meta.bin']:
+        if os.path.isfile(i):
+            os.remove(i)
+    
     tik = 'tik'
     tik_read = tikReader(tik)
     if not tik_read.verify()[0][1]: # Ticket has invalid sig
         tik = ''
     
-    cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
     CDNBuilder(content_files=cf, tik=tik, tmd='tmd', titlekey=titlekey, out=out)
 
     for i in ['tik', 'tmd'] + cf:
@@ -756,495 +852,6 @@ def csu2retailcias(path, out=''):
         cia_dev2retail(path=os.path.join('updates/', i), out=os.path.join(out, i))
     shutil.rmtree('updates/')
 
-def cdn2cia_reversible_decrypt(path, out='', title_ver='', cdn_dev=0, cia_dev=0):
-    """
-    Convert CDN to decrypted CIA with maximum reversibility.
-    
-    This function:
-    - Uses NCCHReader.decrypt() for minimal flag changes (only NoCrypto flag)
-    - Uses TMDBuilderPreserveSignature to preserve original TMD signature
-    - Sets proper TMD content flags for decrypted content
-    - Matches GodMode9's approach for maximum compatibility
-    
-    Args:
-        path: Path to CDN directory
-        out: Output CIA filename (auto-generated if empty)
-        title_ver: Specific title version to use (latest if empty)
-        cdn_dev: Whether CDN is dev (1) or retail (0)
-        cia_dev: Whether output CIA should be dev (1) or retail (0)
-    """
-    os.chdir(path)
-    name = os.path.basename(os.getcwd())
-
-    content_files = []
-    tmds = []
-    tmd = ''
-    tik = ''
-    for i in os.listdir('.'):
-        if i.startswith('tmd.') or i == 'tmd':
-            tmds.append(i)
-        elif i == 'cetk':
-            tik = i
-        elif i.startswith('0'):
-            content_files.append(i)
-    
-    if len(tmds) == 1:
-        tmd = tmds[0]
-    else:
-        tmds.sort(key=lambda h: int(os.path.splitext(h)[1].strip('.') or 0))
-        if title_ver == '':
-            tmd = tmds[-1]
-        else:
-            tmd = f'tmd.{title_ver}'
-    
-    if cia_dev == 0:
-        regen_sig = 'retail'
-    else:
-        regen_sig = 'dev'
-
-    t = TMDReader(tmd)
-    if out == '':
-        out = f'{name}.{t.hdr.title_ver}.decrypted.cia'
-    
-    logger.info(f'Creating reversible decrypted CIA: {out}')
-    
-    # Extract CDN content files
-    cdn = CDNReader(content_files=content_files, tmd=tmd, tik=tik, dev=cdn_dev)
-    cdn.extract()
-    cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
-    logger.debug(f'Extracted content files: {cf}')
-    
-    # Decrypt NCCHs using NCCHReader.decrypt() for minimal flag changes
-    for ncch_file in cf:
-        if ncch_file.endswith('.ncch'):
-            logger.debug(f'Processing {ncch_file}, size: {os.path.getsize(ncch_file)} bytes')
-            
-            # Verify the file is a valid NCCH
-            with open(ncch_file, 'rb') as f:
-                f.seek(0x100)
-                magic = f.read(4)
-                if magic != b'NCCH':
-                    logger.warning(f'{ncch_file} does not appear to be a valid NCCH file (magic: {magic})')
-                    continue
-                
-                # Check current encryption status
-                f.seek(0x18F)  # flags[7]
-                flags = f.read(1)
-                is_decrypted = flags[0] & 0x4 if len(flags) > 0 else False
-                uses_seed = flags[0] & 0x20 if len(flags) > 0 else False
-                
-                logger.debug(f'{ncch_file} - flags[7]: 0x{flags[0]:02x}')
-                logger.debug(f'{ncch_file} - is_decrypted: {is_decrypted}, uses_seed: {uses_seed}')
-                
-                if uses_seed:
-                    logger.info(f'*** {ncch_file} USES SEED CRYPTO ***')
-            
-            # Decrypt NCCH using NCCHReader.decrypt() for minimal flag changes
-            if not is_decrypted:
-                logger.info(f'Decrypting NCCH with minimal flag changes: {ncch_file}')
-                
-                ncch = NCCHReader(ncch_file, dev=cdn_dev)
-                decrypted_file = ncch.decrypt()  # Returns the output filename
-                
-                # Replace original with decrypted version
-                os.remove(ncch_file)
-                shutil.move(decrypted_file, ncch_file)
-                
-                logger.info(f'Successfully decrypted NCCH: {ncch_file}')
-            else:
-                logger.info(f'NCCH already decrypted: {ncch_file}')
-    
-    # Read original TMD for metadata preservation
-    tmd_extracted = tmd + '.extracted'
-    t_orig = TMDReader(tmd_extracted)
-    logger.debug(f'Original TMD has {len(t_orig.files)} content entries')
-    
-    # Calculate new hashes for decrypted content files
-    content_info = []
-    cf_sorted = sorted(cf)  # Ensure consistent order
-    
-    logger.debug(f'Original TMD content chunks:')
-    for chunk in t_orig.content_chunks:
-        logger.debug(f'  Index: {chunk.content_index}, ID: {chunk.contentID:08x}')
-    
-    logger.debug(f'Extracted content files: {cf_sorted}')
-    
-    for i, ncch_file in enumerate(cf_sorted):
-        with open(ncch_file, 'rb') as f:
-            content_data = f.read()
-            content_hash = hashlib.sha256(content_data).digest()
-            content_size = len(content_data)
-        
-        # Get original content info from TMD content chunks
-        original_chunk = None
-        for chunk in t_orig.content_chunks:
-            # Match by filename pattern: index.contentID.ext
-            expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
-            logger.debug(f'  Checking {ncch_file} against expected {expected_name}')
-            if ncch_file == expected_name:
-                original_chunk = chunk
-                logger.debug(f'  ✅ Matched {ncch_file} to content {chunk.contentID:08x}')
-                break
-        
-        if original_chunk is None:
-            # Fallback: use index-based matching
-            original_chunk = t_orig.content_chunks[i]
-            logger.warning(f'No filename match for {ncch_file}, using index-based matching to content {original_chunk.contentID:08x}')
-        
-        content_info.append({
-            'id': original_chunk.contentID,
-            'index': original_chunk.content_index, 
-            'type': original_chunk.content_type & ~0x0001,  # Preserve all flags except encryption flag
-            'size': content_size,
-            'hash': content_hash
-        })
-        
-        logger.debug(f'Content {original_chunk.contentID:08x}: {ncch_file} -> size={content_size}, hash={content_hash.hex()[:16]}...')
-    
-    # Build new TMD with preserved signature and updated content info  
-    tmd_new = 'tmd.decrypted'
-    logger.info(f'Building TMD with preserved signature: {tmd_new}')
-    
-    TMDBuilder(
-        tmd=tmd_extracted,
-        content_info=content_info,
-        preserve_signature=True,
-        out=tmd_new
-    )
-    
-    # Handle ticket
-    if tik == '':
-        tikBuilder(titleID=t_orig.titleID, title_ver=t_orig.hdr.title_ver, 
-                  titlekey=hex(readbe(cdn.titlekey))[2:].zfill(32), 
-                  regen_sig=regen_sig, out='tik')
-        tik = 'tik'
-        tik_to_cleanup = ['tik']
-    else:
-        tik_extracted = tik + '.extracted'
-        tik = tik_extracted
-        tik_to_cleanup = [tik_extracted]
-
-    # Determine if meta should be included
-    meta = 1
-    if t_orig.titleID[3:5] == '48':
-        meta = 0
-    
-    # Debug: Check final TMD content before building CIA
-    debug_tmd = TMDReader(tmd_new)
-    logger.debug('Final TMD content info:')
-    for fname, finfo in debug_tmd.files.items():
-        hash_hex = finfo['hash'].hex() if 'hash' in finfo else None
-        logger.debug(f'  {fname}: size={finfo.get("size")}, type={finfo.get("type")}, hash={hash_hex}')
-    
-    # Build the final CIA
-    logger.info(f'Building final CIA: {out}')
-    CIABuilder(content_files=cf_sorted, tik=tik, tmd=tmd_new, meta=meta, dev=cia_dev, out='tmp.cia')
-    
-    # Clean up temporary files
-    cleanup_files = cf_sorted + tik_to_cleanup + [tmd_extracted, tmd_new]
-    
-    # Also clean up any pattern-based files that might be left over
-    for pattern_file in os.listdir('.'):
-        if pattern_file.startswith('tmd.') and pattern_file.endswith('.extracted'):
-            if pattern_file not in cleanup_files:
-                cleanup_files.append(pattern_file)
-        elif pattern_file.endswith('.ncch') and pattern_file not in cleanup_files:
-            cleanup_files.append(pattern_file)
-        elif pattern_file == 'cetk.extracted' and pattern_file not in cleanup_files:
-            cleanup_files.append(pattern_file)
-    
-    for i in cleanup_files:
-        if os.path.isfile(i):
-            logger.debug(f'Cleaning up: {i}')
-            os.remove(i)
-
-    shutil.move('tmp.cia', '../tmp.cia')
-    os.chdir('..')
-    shutil.move('tmp.cia', out)
-    
-    logger.info(f'Successfully created reversible decrypted CIA: {out}')
-    print(f"Created reversible decrypted CIA: {out}")
-    print("This CIA uses minimal NCCH flag changes and preserves the original TMD signature for maximum reversibility.")
-    
-    return out
-
-def cia_re_encrypt(reversible_cia_path, out='', cia_dev=0):
-    """
-    Re-encrypt a reversible decrypted CIA back to its original encrypted state.
-    This reverses the cdn2cia_reversible_decrypt process.
-    
-    Args:
-        reversible_cia_path: Path to the reversible decrypted CIA
-        out: Output path for re-encrypted CIA
-        cia_dev: Whether to use dev crypto (0=retail, 1=dev)
-    
-    Returns:
-        Path to the re-encrypted CIA
-    """
-    logger = logging.getLogger(__name__)
-    
-    name = os.path.splitext(os.path.basename(reversible_cia_path))[0]
-    if out == '':
-        if name.endswith('.decrypted'):
-            out = name[:-10] + '.re_encrypted.cia'
-        else:
-            out = f'{name}.re_encrypted.cia'
-    
-    # Extract the reversible CIA
-    cia = CIAReader(reversible_cia_path, cia_dev)
-    cia.extract()
-    
-    # Clean up CIA components we don't need
-    for cleanup_file in ['cia_header.bin', 'cert.bin', 'meta.bin']:
-        if os.path.isfile(cleanup_file):
-            os.remove(cleanup_file)
-    
-    # Get content files and TMD
-    cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
-    # Filter out any backup files that might have been created
-    cf = [f for f in cf if not f.startswith('first_content.')]
-    tmd_file = 'tmd'
-    tik_file = 'tik'
-    
-    # Read the current (decrypted) TMD to get metadata
-    tmd_reader = TMDReader(tmd_file, cia_dev)
-    logger.info(f'Current TMD has {len(tmd_reader.files)} content entries')
-    
-    # Re-encrypt NCCH files
-    encrypted_files = []
-    for ncch_file in cf:
-        if ncch_file.endswith('.ncch'):
-            logger.info(f'Re-encrypting NCCH: {ncch_file}')
-            ncch = NCCHReader(ncch_file, dev=cia_dev)
-            
-            if ncch.is_decrypted:
-                encrypted_file = ncch.encrypt()
-                
-                # Replace decrypted with encrypted version
-                os.remove(ncch_file)
-                shutil.move(encrypted_file, ncch_file)
-                logger.info(f'Successfully re-encrypted NCCH: {ncch_file}')
-            else:
-                logger.info(f'NCCH already encrypted: {ncch_file}')
-        encrypted_files.append(ncch_file)
-    
-    # Calculate new hashes for re-encrypted content files and build encrypted TMD
-    content_info = []
-    cf_sorted = sorted(cf)  # Ensure consistent order
-    
-    for i, ncch_file in enumerate(cf_sorted):
-        with open(ncch_file, 'rb') as f:
-            content_data = f.read()
-            content_hash = hashlib.sha256(content_data).digest()
-            content_size = len(content_data)
-        
-        # Get original content info from decrypted TMD
-        # Extract content info from filename (format: index.contentID.ext)
-        filename_parts = ncch_file.split('.')
-        content_index = int(filename_parts[0], 16)
-        content_id = int(filename_parts[1], 16)
-        
-        content_info.append({
-            'id': content_id,
-            'index': content_index,
-            'type': 0x1,  # Set to encrypted (standard)
-            'size': content_size,
-            'hash': content_hash
-        })
-    
-    # Build new TMD with encrypted content flags and preserved signature
-    tmd_encrypted = 'tmd.encrypted'
-    TMDBuilder(
-        tmd=tmd_file,
-        content_info=content_info,
-        crypt=1,  # Set encrypted flag
-        out=tmd_encrypted
-    )
-    
-    # Use the encrypted TMD
-    os.remove(tmd_file)
-    shutil.move(tmd_encrypted, tmd_file)
-    
-    # Check if ticket has valid signature, generate fake one if needed
-    tik_read = tikReader(tik_file)
-    if not tik_read.verify()[0][1]:  # Ticket has invalid sig
-        logger.info('Regenerating ticket with fake signature')
-        regen_sig = 'dev' if cia_dev else 'retail'
-        tikBuilder(
-            titleID=tmd_reader.titleID,
-            title_ver=tmd_reader.hdr.title_ver,
-            regen_sig=regen_sig,
-            out='tik_new'
-        )
-        os.remove(tik_file)
-        shutil.move('tik_new', tik_file)
-    
-    # Build the re-encrypted CIA
-    meta = 1
-    if tmd_reader.titleID[3:5] == '48':
-        meta = 0
-    
-    CIABuilder(content_files=cf, tik=tik_file, tmd=tmd_file, meta=meta, dev=cia_dev, out=out)
-    
-    # Cleanup
-    for cleanup_file in [tik_file, tmd_file] + cf:
-        if os.path.isfile(cleanup_file):
-            os.remove(cleanup_file)
-    
-    logger.info(f'Re-encrypted CIA saved to: {out}')
-    return out
-
-def cia2cdn_encrypted(reversible_cia_path, out='', cia_dev=0, titlekey=''):
-    """
-    Convert a reversible decrypted CIA back to original encrypted CDN format.
-    This completes the full round-trip: CDN → Decrypted CIA → Original CDN.
-    
-    Args:
-        reversible_cia_path: Path to the reversible decrypted CIA
-        out: Output directory name for CDN files
-        cia_dev: Whether CIA uses dev crypto (0=retail, 1=dev)
-        titlekey: Optional titlekey override (hex string)
-    
-    Returns:
-        Path to the output CDN directory
-    """
-    logger = logging.getLogger(__name__)
-    
-    name = os.path.splitext(os.path.basename(reversible_cia_path))[0]
-    if out == '':
-        if name.endswith('.decrypted'):
-            out = name[:-10] + '_reconstructed_cdn'
-        else:
-            out = f'{name}_reconstructed_cdn'
-    
-    # Extract the reversible CIA
-    logger.info(f'Extracting reversible decrypted CIA: {reversible_cia_path}')
-    cia = CIAReader(reversible_cia_path, cia_dev)
-    cia.extract()
-    
-    # Clean up CIA components we don't need
-    for cleanup_file in ['cia_header.bin', 'cert.bin', 'meta.bin']:
-        if os.path.isfile(cleanup_file):
-            os.remove(cleanup_file)
-    
-    # Get content files and TMD/TIK
-    cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
-    tmd_file = 'tmd'
-    tik_file = 'tik'
-    
-    # Read the current (decrypted) TMD to get metadata
-    tmd_reader = TMDReader(tmd_file, cia_dev)
-    logger.info(f'TMD has {len(tmd_reader.files)} content entries')
-    
-    # Re-encrypt NCCH files
-    logger.info('Re-encrypting NCCH files...')
-    for ncch_file in cf:
-        if ncch_file.endswith('.ncch'):
-            logger.debug(f'Processing NCCH: {ncch_file}')
-            ncch = NCCHReader(ncch_file, dev=cia_dev)
-            
-            if ncch.is_decrypted:
-                logger.info(f'Re-encrypting NCCH: {ncch_file}')
-                encrypted_file = ncch.encrypt()
-                
-                # Replace decrypted with encrypted version
-                os.remove(ncch_file)
-                shutil.move(encrypted_file, ncch_file)
-                logger.debug(f'Successfully re-encrypted: {ncch_file}')
-            else:
-                logger.debug(f'NCCH already encrypted: {ncch_file}')
-    
-    # Calculate new hashes for re-encrypted content files
-    content_info = []
-    cf_sorted = sorted(cf)  # Ensure consistent order
-    
-    for i, ncch_file in enumerate(cf_sorted):
-        with open(ncch_file, 'rb') as f:
-            content_data = f.read()
-            content_hash = hashlib.sha256(content_data).digest()
-            content_size = len(content_data)
-        
-        # Get original content info from decrypted TMD
-        # Find the matching content chunk by filename pattern
-        original_chunk = None
-        for chunk in tmd_reader.content_chunks:
-            expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
-            if ncch_file == expected_name:
-                original_chunk = chunk
-                break
-        
-        if original_chunk is None:
-            # Fallback: use index-based matching
-            original_chunk = tmd_reader.content_chunks[i]
-            logger.warning(f'No filename match for {ncch_file}, using index-based matching')
-        
-        content_info.append({
-            'id': original_chunk.contentID,
-            'index': original_chunk.content_index,
-            'type': original_chunk.content_type | 0x0001,  # Preserve all flags and add encryption flag
-            'size': content_size,
-            'hash': content_hash
-        })
-    
-    # Build new TMD with encrypted content flags (for CDN) and preserved signature
-    logger.info('Building encrypted TMD for CDN with preserved signature...')
-    tmd_encrypted = 'tmd.encrypted'
-    TMDBuilder(
-        tmd=tmd_file,
-        content_info=content_info,
-        crypt=1,  # Set encrypted flag for CDN format
-        out=tmd_encrypted
-    )
-    
-    # Get titlekey from ticket or use provided one
-    if titlekey == '':
-        tik_read = tikReader(tik_file)
-        titlekey_bytes = tik_read.titlekey
-        titlekey = titlekey_bytes.hex()
-        logger.debug(f'Using titlekey from ticket: {titlekey}')
-    else:
-        logger.debug(f'Using provided titlekey: {titlekey}')
-    
-    # Use CDNBuilder to create the final CDN structure
-    logger.info(f'Building CDN structure in directory: {out}')
-    CDNBuilder(
-        content_files=cf_sorted,
-        tik=tik_file if os.path.exists(tik_file) else '',
-        tmd=tmd_encrypted,
-        titlekey=titlekey,
-        out=out
-    )
-    
-    # Handle additional CDN files that aren't part of the CIA
-    logger.info('Handling additional CDN files...')
-    
-    # Copy seeddb.bin if it exists in resources
-    # Check multiple possible locations for seeddb.bin
-    seeddb_paths = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resources', 'seeddb.bin'),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib', 'resources', 'seeddb.bin'),
-        os.path.join(os.getcwd(), 'resources', 'seeddb.bin'),
-        os.path.join(os.getcwd(), 'seeddb.bin'),
-    ]
-    seeddb_source = None
-    for path in seeddb_paths:
-        if os.path.exists(path):
-            seeddb_source = path
-            break
-    
-    # Cleanup temporary files
-    cleanup_files = cf_sorted + [tik_file, tmd_file, tmd_encrypted]
-    for cleanup_file in cleanup_files:
-        if os.path.isfile(cleanup_file):
-            logger.debug(f'Cleaning up: {cleanup_file}')
-            os.remove(cleanup_file)
-    
-    logger.info(f'Successfully reconstructed CDN in directory: {out}')
-    print(f"Reconstructed CDN files in: {out}")
-    print("This CDN contains the original encrypted content reconstructed from the reversible CIA.")
-    
-    return out
-
 def cia2cia(path, out='', cia_dev=0, force_mode=''):
     """
     Smart CIA cross-crypto converter that auto-detects encryption state and flips it.
@@ -1259,65 +866,45 @@ def cia2cia(path, out='', cia_dev=0, force_mode=''):
     Returns:
         Path to the converted CIA
     """
-    logger = logging.getLogger(__name__)
-    
     name = os.path.splitext(os.path.basename(path))[0]
     
     # Extract CIA to analyze content state
-    logger.info(f'Analyzing CIA: {path}')
     cia = CIAReader(path, cia_dev)
     cia.extract()
     
-    # Read TMD to check encryption state
-    tmd_reader = TMDReader('tmd', cia_dev)
+    # Use CIAReader's TMD instance to check encryption state
+    tmd_reader = cia.tmd  # CIAReader already has TMDReader instance
     cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
     
-    # Determine current encryption state
+    # Determine current encryption state from TMD flags
     is_decrypted_content = False
     is_encrypted_content = False
     
-    # Check TMD content type flags
     for chunk in tmd_reader.content_chunks:
         if (chunk.content_type & 1) == 0:  # Missing encryption flag
             is_decrypted_content = True
         else:  # Has encryption flag
             is_encrypted_content = True
     
-    # Also check actual NCCH files for encryption state
-    actual_decrypted = 0
-    actual_encrypted = 0
-    
-    for ncch_file in cf:
-        if ncch_file.endswith('.ncch'):
-            ncch = NCCHReader(ncch_file, dev=cia_dev)
-            if ncch.is_decrypted:
-                actual_decrypted += 1
-            else:
-                actual_encrypted += 1
-    
-    # Clean up extracted files first
-    for cleanup_file in ['cia_header.bin', 'cert.bin', 'tmd', 'tik', 'meta.bin'] + cf:
-        if os.path.isfile(cleanup_file):
-            os.remove(cleanup_file)
-    
     # Determine what operation to perform
     if force_mode == 'encrypt':
         target_mode = 'encrypt'
-        logger.info('Force mode: Converting to encrypted CIA')
     elif force_mode == 'decrypt':
         target_mode = 'decrypt'
-        logger.info('Force mode: Converting to decrypted CIA')
     else:
         # Auto-detect based on current state
-        if is_decrypted_content or actual_decrypted > actual_encrypted:
+        if is_decrypted_content:
             target_mode = 'encrypt'
-            logger.info('Auto-detected decrypted content - converting to encrypted CIA')
-        elif is_encrypted_content or actual_encrypted > actual_decrypted:
+        elif is_encrypted_content:
             target_mode = 'decrypt'
-            logger.info('Auto-detected encrypted content - converting to decrypted CIA')
         else:
-            logger.warning('Unable to determine encryption state - defaulting to decrypt')
-            target_mode = 'decrypt'
+            target_mode = 'decrypt'  # Default to decrypt
+    
+    # Check if CIA is already in target state
+    if (target_mode == 'decrypt' and is_decrypted_content and not is_encrypted_content) or \
+       (target_mode == 'encrypt' and is_encrypted_content and not is_decrypted_content):
+        print(f"CIA {path} is already in target state ({target_mode}ed). Skipping processing.")
+        return path
     
     # Generate output filename if not provided
     if out == '':
@@ -1332,29 +919,152 @@ def cia2cia(path, out='', cia_dev=0, force_mode=''):
             else:
                 out = f'{name}.decrypted.cia'
     
-    # Perform the conversion
-    if target_mode == 'encrypt':
-        # Convert decrypted CIA to encrypted CIA
-        logger.info('Re-encrypting CIA content...')
-        result = cia_re_encrypt(path, out, cia_dev)
-    else:
-        # Convert encrypted CIA to decrypted CIA via CDN round-trip
-        # This ensures we get a proper reversible decrypted CIA
-        logger.info('Decrypting CIA content via CDN conversion...')
-        
-        # First convert to CDN
-        temp_cdn_dir = f'temp_cdn_{name}'
-        cia2cdn_encrypted(path, temp_cdn_dir, cia_dev)
-        
-        # Then convert back to decrypted CIA with reversible mode
-        result = cdn2cia_reversible_decrypt(temp_cdn_dir, out, '', 0, cia_dev)
-        
-        # Clean up temporary CDN directory
-        if os.path.exists(temp_cdn_dir):
-            shutil.rmtree(temp_cdn_dir)
+    # Prevent overwriting input file
+    if os.path.abspath(out) == os.path.abspath(path):
+        print(f"Warning: Output file would overwrite input file {path}. Adding suffix.")
+        base, ext = os.path.splitext(out)
+        out = f"{base}.converted{ext}"
     
-    logger.info(f'CIA conversion completed: {result}')
-    print(f"Converted CIA: {path} -> {result}")
+    # Branch: Perform encryption or decryption using unified logic
+    if target_mode == 'encrypt':
+        logger.info('Re-encrypting NCCH files and building TMD for encrypted CIA...')
+        
+        # Re-encrypt NCCH files if needed
+        for ncch_file in cf:
+            if ncch_file.endswith('.ncch'):
+                ncch = NCCHReader(ncch_file, dev=cia_dev)
+                if ncch.is_decrypted:
+                    encrypted_file = ncch.encrypt()
+                    os.remove(ncch_file)
+                    shutil.move(encrypted_file, ncch_file)
+        
+        # Calculate new hashes and rebuild TMD for encrypted content
+        content_info = []
+        cf_sorted = sorted(cf)
+        
+        for i, ncch_file in enumerate(cf_sorted):
+            with open(ncch_file, 'rb') as f:
+                content_data = f.read()
+                content_hash = hashlib.sha256(content_data).digest()
+                content_size = len(content_data)
+            
+            # Match with original content chunk to preserve all flags except encryption
+            original_chunk = None
+            for chunk in tmd_reader.content_chunks:
+                expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
+                if ncch_file == expected_name:
+                    original_chunk = chunk
+                    break
+            
+            if original_chunk is None:
+                original_chunk = tmd_reader.content_chunks[i]
+            
+            content_info.append({
+                'id': original_chunk.contentID,
+                'index': original_chunk.content_index,
+                'type': original_chunk.content_type | 0x0001,  # Add encryption flag
+                'size': content_size,
+                'hash': content_hash
+            })
+        
+        # Build new TMD with encrypted content flags
+        tmd_encrypted = 'tmd.encrypted'
+        TMDBuilder(
+            tmd='tmd',
+            content_info=content_info,
+            crypt=1,  # Set encrypted flag
+            out=tmd_encrypted
+        )
+        
+        os.remove('tmd')
+        shutil.move(tmd_encrypted, 'tmd')
+        
+    else:  # target_mode == 'decrypt'
+        logger.info('Decrypting NCCH files and building reversible TMD...')
+        
+        # Decrypt NCCH files if needed
+        for ncch_file in cf:
+            if ncch_file.endswith('.ncch'):
+                ncch = NCCHReader(ncch_file, dev=cia_dev)
+                if not ncch.is_decrypted:
+                    decrypted_file = ncch.decrypt()
+                    os.remove(ncch_file)
+                    shutil.move(decrypted_file, ncch_file)
+        
+        # Calculate new hashes and rebuild TMD for decrypted content
+        content_info = []
+        cf_sorted = sorted(cf)
+        
+        for i, ncch_file in enumerate(cf_sorted):
+            with open(ncch_file, 'rb') as f:
+                content_data = f.read()
+                content_hash = hashlib.sha256(content_data).digest()
+                content_size = len(content_data)
+            
+            # Match with original content chunk to preserve all flags except encryption
+            original_chunk = None
+            for chunk in tmd_reader.content_chunks:
+                expected_name = f'{hex(chunk.content_index)[2:].zfill(4)}.{hex(chunk.contentID)[2:].zfill(8)}.ncch'
+                if ncch_file == expected_name:
+                    original_chunk = chunk
+                    break
+            
+            if original_chunk is None:
+                original_chunk = tmd_reader.content_chunks[i]
+            
+            content_info.append({
+                'id': original_chunk.contentID,
+                'index': original_chunk.content_index,
+                'type': original_chunk.content_type & ~0x0001,  # Remove encryption flag only
+                'size': content_size,
+                'hash': content_hash
+            })
+        
+        # Build new TMD with decrypted content flags
+        tmd_decrypted = 'tmd.decrypted'
+        TMDBuilder(
+            tmd='tmd',
+            content_info=content_info,
+            preserve_signature=True,
+            out=tmd_decrypted
+        )
+        
+        os.remove('tmd')
+        shutil.move(tmd_decrypted, 'tmd')
+    
+    # Clean up CIA components we don't need
+    for i in ['cia_header.bin', 'cert.bin', 'meta.bin']:
+        if os.path.isfile(i):
+            os.remove(i)
+    
+    # Check ticket
+    tik = 'tik'
+    tik_read = tikReader(tik)
+    if not tik_read.verify()[0][1]:  # Ticket has invalid sig
+        regen_sig = 'dev' if cia_dev else 'retail'
+        tikBuilder(
+            titleID=tmd_reader.titleID,
+            title_ver=tmd_reader.hdr.title_ver,
+            regen_sig=regen_sig,
+            out='tik_new'
+        )
+        os.remove('tik')
+        shutil.move('tik_new', 'tik')
+    
+    # Determine meta based on title type
+    meta = 1
+    if tmd_reader.titleID[3:5] == '48':
+        meta = 0
+    
+    # Build the final CIA
+    CIABuilder(content_files=cf, tik='tik', tmd='tmd', meta=meta, dev=cia_dev, out=out)
+    
+    # Cleanup
+    for cleanup_file in ['tik', 'tmd'] + cf:
+        if os.path.isfile(cleanup_file):
+            os.remove(cleanup_file)
+    
+    print(f"Converted CIA: {path} -> {out}")
     print(f"Operation: {target_mode.title()}ed CIA content")
     
-    return result
+    return out

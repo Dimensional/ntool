@@ -79,6 +79,14 @@ Examples:
     cia2cdn_parser.add_argument('--titlekey', help='Title key to use')
     cia2cdn_parser.add_argument('--cia-dev', action='store_true', help='Input CIA is dev-signed')
     
+    # CIA to CIA conversion (encrypt/decrypt)
+    cia2cia_parser = subparsers.add_parser('cia2cia', help='Convert CIA encryption state (encrypt/decrypt)')
+    cia2cia_parser.add_argument('input', help='Path to input CIA file')
+    cia2cia_parser.add_argument('--out', help='Path to output CIA file')
+    cia2cia_parser.add_argument('--cia-dev', action='store_true', help='Input CIA is dev-signed')
+    cia2cia_parser.add_argument('--force-mode', choices=['encrypt', 'decrypt'], 
+                               help='Force specific mode (default: auto-detect)')
+    
     # Extract/rebuild commands
     for format_type in ['ncch', 'cia', 'cci']:
         for action in ['extractall', 'rebuildall']:
@@ -131,6 +139,11 @@ def main():
     elif args.command == 'cia2cdn':
         cia2cdn(args.input, args.out or '', args.titlekey or '',
                1 if args.cia_dev else 0)
+    
+    elif args.command == 'cia2cia':
+        cia2cia(args.input, args.out or '', 
+               1 if args.cia_dev else 0,
+               args.force_mode or '')
 
 if __name__ == '__main__':
     main()
