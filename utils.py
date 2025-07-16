@@ -642,6 +642,7 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
     cdn.extract()
     cf = [i for i in os.listdir('.') if i.endswith('.ncch') or i.endswith('.nds')]
     
+    tmd_original = tmd  # Store original TMD filename for cleanup
     tmd += '.extracted'
     
     # Branch: If decrypt requested, decrypt NCCHs and rebuild TMD
@@ -712,7 +713,12 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
     
     CIABuilder(content_files=cf, tik=tik, tmd=tmd, meta=meta, dev=cia_dev, out='tmp.cia')
     
-    for i in cf + [tik, tmd]:
+    # Clean up all TMD files (original extracted and any new ones)
+    cleanup_files = cf + [tik, tmd]
+    if decrypt and tmd_original + '.extracted' != tmd:
+        cleanup_files.append(tmd_original + '.extracted')
+    
+    for i in cleanup_files:
         if os.path.isfile(i):
             os.remove(i)
 
