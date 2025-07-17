@@ -1,6 +1,6 @@
 from lib.common import *
 from lib.keys import NTR, TWL, CTR
-from lib.ctr_cia import CIAReader, CIABuilder
+from lib.ctr_cia import CIAReader, CIABuilder, should_generate_metadata
 from lib.ctr_cci import CCIReader, CCIBuilder
 from lib.ctr_ncch import NCCHReader, NCCHBuilder
 from lib.ctr_exefs import ExeFSReader, ExeFSBuilder
@@ -98,6 +98,12 @@ def cia_dev2retail(path, out=''):
     else:
         meta = 0
 
+    # Override metadata decision based on NCCH type
+    if should_generate_metadata(cf):
+        meta = 1
+    else:
+        meta = 0
+
     for i in cf:
         if i.endswith('.ncch'):
             ncch = NCCHReader(i, dev=1)
@@ -159,6 +165,12 @@ def cia_retail2dev(path, out=''):
     if 'meta.bin' in cf:
         meta = 1
         cf.remove('meta.bin')
+    else:
+        meta = 0
+
+    # Override metadata decision based on NCCH type
+    if should_generate_metadata(cf):
+        meta = 1
     else:
         meta = 0
 
@@ -504,6 +516,9 @@ def cia_rebuildall(path, dev=0):
             else:
                 cf.append(i)
 
+    # Override metadata decision based on NCCH type
+    meta = should_generate_metadata(cf)
+    
     CIABuilder(certs='cert.bin', content_files=cf, tik='tik', tmd='tmd', meta=meta, dev=dev, out=out)
     if not os.path.isfile(f'../{out}'):
         shutil.move(out, f'../{out}')
@@ -582,7 +597,8 @@ def cci2cia(path, out='', cci_dev=0, cia_dev=0):
     TMDBuilder(content_files=cf, content_files_dev=cia_dev, titleID=hex(readle(cci.hdr.mediaID))[2:].zfill(16), title_ver=0, crypt=0, regen_sig=regen_sig, out='tmd')
     tikBuilder(titleID=hex(readle(cci.hdr.mediaID))[2:].zfill(16), title_ver=0, regen_sig=regen_sig, out='tik')
 
-    CIABuilder(content_files=cf, tik='tik', tmd='tmd', meta=1, dev=cia_dev, out=out)
+    meta = should_generate_metadata(cf)
+    CIABuilder(content_files=cf, tik='tik', tmd='tmd', meta=meta, dev=cia_dev, out=out)
     
     for i in ['cci_header.bin', 'card_info.bin', 'mastering_info.bin', 'initialdata.bin', 'card_device_info.bin'] + cf:
         if os.path.exists(i):
@@ -707,9 +723,7 @@ def cdn2cia(path, out='', title_ver='', cdn_dev=0, cia_dev=0, decrypt=0):
     else:
         tik += '.extracted'
 
-    meta = 1
-    if t.titleID[3:5] == '48':
-        meta = 0
+    meta = should_generate_metadata(cf)
     
     CIABuilder(content_files=cf, tik=tik, tmd=tmd, meta=meta, dev=cia_dev, out='tmp.cia')
     
@@ -1057,10 +1071,8 @@ def cia2cia(path, out='', cia_dev=0, force_mode=''):
         os.remove('tik')
         shutil.move('tik_new', 'tik')
     
-    # Determine meta based on title type
-    meta = 1
-    if tmd_reader.titleID[3:5] == '48':
-        meta = 0
+    # Determine meta based on NCCH type
+    meta = should_generate_metadata(cf)
     
     # Build the final CIA
     CIABuilder(content_files=cf, tik='tik', tmd='tmd', meta=meta, dev=cia_dev, out=out)

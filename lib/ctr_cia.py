@@ -3,6 +3,45 @@ from .keys import *
 from .ctr_tik import signature_types, tikReader
 from .ctr_tmd import TMDReader, TMDBuilder
 from .ctr_ncch import NCCHReader
+import logging
+
+logger = logging.getLogger(__name__)
+
+def should_generate_metadata(content_files):
+    """
+    Determine if metadata should be generated based on NCCH content type.
+    According to 3dbrew, metadata only is generated for CXI content, but still supposedly options.
+    
+    Args:
+        content_files: List of content files
+    
+    Returns:
+        bool: True if metadata should be generated, False otherwise
+    """
+    if not content_files:
+        return False
+    
+    # Scan through all NCCH files to check for CXI content
+    for cf in content_files:
+        if not cf.endswith('.ncch'):
+            continue
+        
+        try:
+            # Read NCCH header to check if it's CXI or CFA
+            with open(cf, 'rb') as f:
+                f.seek(0x188)  # Offset to flags field
+                flags = f.read(8)
+                
+                # Check if it's a CXI (flags[5] & 0x2) - CXI files should have metadata
+                if flags[5] & 0x2:  # CXI bit set
+                    return True
+                    
+        except Exception as e:
+            logger.warning(f'Could not determine NCCH type for {cf}: {e}')
+            continue
+    
+    # If we've scanned all files and found no CXI, return False
+    return False
 
 class CIAHdr(Structure):
     _fields_ = [
